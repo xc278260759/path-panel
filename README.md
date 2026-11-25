@@ -44,3 +44,7 @@ build_路径面板.bat
 ## 仓库约定
 
 `.gitignore` 采用白名单：只有上表文件入库。新增源文件时需要把文件名加进 `.gitignore` 的 `!` 列表。
+
+## 许可证
+
+MIT License，见 [LICENSE](LICENSE)。
