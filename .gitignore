@@ -1,0 +1,9 @@
+# -*- mode: gitignore -*-
+# 白名单：只跟踪“路径面板”项目自身文件，目录里其他脚本不入库。
+*
+!.gitignore
+!README.md
+!路径面板.pyw
+!路径面板.ico
+!路径面板_说明.md
+!build_路径面板.bat
