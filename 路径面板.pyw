@@ -2,18 +2,18 @@
 """
 路径面板 (Path Panel)
 ------------------------------------------------
-用途：把常用的文件/文件夹路径收藏起来，用快捷键呼出面板，
-      选中后直接把真实路径粘贴到当前输入框。
+用途：把常用的路径、文本片段、图片收藏起来，用快捷键呼出面板，
+      自动按类型归类（路径 / 文本 / 图片），选中后粘贴到当前输入框。
 
 热键：
     Win + Alt + V   呼出/关闭面板
-    Win + Alt + C   把剪贴板里的路径加入收藏
+    Win + Alt + C   把当前选中或剪贴板里的内容加入收藏（自动分类）
 
 托盘：显示面板 / 从剪贴板添加 / 设置 / 开机自启 / 退出
-数据：%APPDATA%\\路径面板\\paths.json
+数据：%APPDATA%\\路径面板\\items.json（旧 paths.json 会自动迁移）
 日志：%APPDATA%\\路径面板\\log.txt
 
-依赖：Python 3.7 + Pillow + pystray（tkinter 自带）
+依赖：Python 3.7 + Pillow + pystray + pypinyin（tkinter 自带）
 """
 
 import ctypes
@@ -33,9 +33,19 @@ from ctypes import wintypes
 APP_NAME = "路径面板"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 IMAGE_DIR = os.path.join(APP_DIR, "images")
-DATA_FILE = os.path.join(APP_DIR, "paths.json")
+DATA_FILE = os.path.join(APP_DIR, "items.json")
+OLD_DATA_FILE = os.path.join(APP_DIR, "paths.json")
 LOG_FILE = os.path.join(APP_DIR, "log.txt")
 MUTEX_NAME = "Local\\PathPanel_SingleInstance"
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff",
+              ".ico", ".heic", ".heif", ".avif", ".psd")
+TYPE_ORDER = ("path", "text", "image")
+TYPE_LABEL = {"path": "路径", "text": "文本", "image": "图片"}
+
+MAX_TEXT_CHARS = 100000          # 单条文本上限（约 100KB）
+MAX_IMAGES = 200                 # 图片副本最多保留张数
+MAX_IMAGE_BYTES = 50 * 1024 * 1024   # 单张图片上限 50MB
 
 DEFAULTS = {
     "entries": [],                # 收藏条目：[{"type": "path/text/image", "value": ...}]
@@ -46,6 +56,9 @@ DEFAULTS = {
     "double_confirm": True,       # 双击条目时自动回车确认（地址栏跳转/表单提交）
     "confirm_whitelist": ["explorer.exe"],  # 这些应用里即使关闭自动确认也会回车
     "auto_collect": True,         # 自动收录复制到剪贴板的路径
+    "sort_by_letter": True,       # 自动排序；关闭后回到手动排序
+    "group_style": "letter",      # letter=盘符/字母标题(默认)  color=彩色分割条
+    "active_tab": "path",         # 上次停留的分类页
     "autostart": False,
 }
 
@@ -604,6 +617,186 @@ def clipboard_paths_as_entries(mode="dir"):
     return entries_from_clip(clipboard_files(), clipboard_text(), mode)
 
 
+# ---------------------------------------------------------------- 分类与排序
+
+_CJK_RE = re.compile(u"[\u3400-\u4dbf\u4e00-\u9fff]")
+_sort_cache = {}
+
+
+def is_image_file(path):
+    return os.path.splitext(path or "")[1].lower() in IMAGE_EXTS
+
+
+def entry_name(it):
+    """条目用于显示/排序的名字。"""
+    v = it.get("value") or ""
+    t = it.get("type")
+    if t == "text":
+        first = v.strip().splitlines()[0].strip() if v.strip() else ""
+        return first or "（空文本）"
+    base = os.path.basename(v.rstrip("\\/"))
+    if t == "image":
+        return base or "图片"
+    return base or v
+
+
+def _pinyin_words(s):
+    try:
+        from pypinyin import lazy_pinyin
+        return "".join(lazy_pinyin(s)).lower()
+    except Exception:
+        return s.lower()
+
+
+def entry_initial(name):
+    """首字母分组：数字/符号 → #，中文 → 拼音首字母。"""
+    s = (name or "").strip()
+    if not s:
+        return "#"
+    c = s[0]
+    if c.isdigit():
+        return "#"
+    if ord(c) < 128:
+        return c.upper() if c.isalpha() else "#"
+    if _CJK_RE.match(c):
+        try:
+            from pypinyin import lazy_pinyin, Style
+            ini = lazy_pinyin(c, style=Style.FIRST_LETTER)[0]
+            if ini and ini.isalpha():
+                return ini[0].upper()
+        except Exception:
+            pass
+    return "#"
+
+
+def entry_sort_key(it):
+    name = entry_name(it)
+    ini = entry_initial(name)
+    group = (0 if ini == "#" else 1, ini)
+    key = _sort_cache.get(name)
+    if key is None:
+        key = _pinyin_words(name) if _CJK_RE.search(name) else name.lower()
+        if len(_sort_cache) > 4000:
+            _sort_cache.clear()
+        _sort_cache[name] = key
+    return group + (key,)
+
+
+_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/]")
+
+
+def path_drive_label(value):
+    """盘符分组标签：C: / D: / …；UNC 归“网络”，无盘符归 #。"""
+    s = (value or "").strip()
+    m = _DRIVE_RE.match(s)
+    if m:
+        return m.group(1).upper() + ":"
+    if s.startswith("\\\\") or s.startswith("//"):
+        return "网络"
+    return "#"
+
+
+def entry_group(it, by_drive=False):
+    """返回 (排序层级, 分组标签)。by_drive 时路径按盘符分组。"""
+    if by_drive and it.get("type") == "path":
+        lbl = path_drive_label(it.get("value"))
+        if lbl == "网络":
+            return (2, "网络")
+        if lbl == "#":
+            return (3, "#")
+        return (1, lbl)
+    name = entry_name(it)
+    ini = entry_initial(name)
+    return (0 if ini == "#" else 1, ini)
+
+
+def entry_sort_key_for(it, by_drive=False):
+    group = entry_group(it, by_drive)
+    if by_drive and it.get("type") == "path":
+        return group + ((it.get("value") or "").lower(),)
+    name = entry_name(it)
+    key = _sort_cache.get(name)
+    if key is None:
+        key = _pinyin_words(name) if _CJK_RE.search(name) else name.lower()
+        if len(_sort_cache) > 4000:
+            _sort_cache.clear()
+        _sort_cache[name] = key
+    return group + (key,)
+
+
+GROUP_COLORS = ["#4f8cff", "#3fc78f", "#f0b429", "#e8613c",
+                "#a06cd5", "#49b7d0", "#e07a9a", "#7aa874"]
+
+
+def mix_color(c1, c2, t):
+    """把 c2 按比例 t (0-1) 混进 c1，用于给卡片底着色。"""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def group_color(label):
+    """颜色分组模式：每个盘符/字母分组一个固定颜色。"""
+    s = (label or "").strip()
+    if len(s) == 2 and s[0].isalpha() and s[1] == ":":
+        return GROUP_COLORS[(ord(s[0].upper()) - 65) % len(GROUP_COLORS)]
+    if s in ("网络", "#"):
+        return "#6a6a6a"
+    return GROUP_COLORS[(sum(ord(c) for c in s)) % len(GROUP_COLORS)]
+
+
+def classify_items(files, txt, img, mode="dir"):
+    """把取到的内容拆成条目并判定类型。
+
+    - 图片文件 → image
+    - 其他文件/文件夹 → path（mode=dir 时文件取所在目录）
+    - 纯文本：每行都像路径 → path；否则 → text
+    - 剪贴板位图 → 存盘后作为 image
+    """
+    out = []
+    if files:
+        for p in files:
+            v = clean_path(p)
+            if not v:
+                continue
+            if is_image_file(v):
+                out.append({"type": "image", "value": v})
+            elif os.path.isfile(v) and mode == "dir":
+                d = os.path.dirname(v)
+                out.append({"type": "path", "value": clean_path(d) if d else v})
+            else:
+                out.append({"type": "path", "value": v})
+        return out
+    if txt:
+        t = txt.replace("\x00", "").strip()
+        if not t:
+            return out
+        if len(t) > MAX_TEXT_CHARS:
+            t = t[:MAX_TEXT_CHARS]
+            log("text truncated to %d chars" % MAX_TEXT_CHARS)
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        if lines and all(is_probably_path(ln) for ln in lines):
+            for ln in lines:
+                p = clean_path(ln)
+                if p:
+                    out.append({"type": "path", "value": p})
+        else:
+            out.append({"type": "text", "value": t})
+        return out
+    if img is not None:
+        p = save_image_file(img, IMAGE_DIR)
+        if p:
+            try:
+                if os.path.getsize(p) > MAX_IMAGE_BYTES:
+                    os.remove(p)
+                    log("image too large, dropped: %s" % p)
+                    return out
+            except Exception:
+                pass
+            out.append({"type": "image", "value": p})
+    return out
+
+
 # ---------------------------------------------------------------- 数据
 
 class Store(object):
@@ -629,8 +822,12 @@ class Store(object):
 
     def load(self):
         try:
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE, "r", encoding="utf-8") as f:
+            src = DATA_FILE
+            if not os.path.exists(src) and os.path.exists(OLD_DATA_FILE):
+                src = OLD_DATA_FILE
+                log("migrate from paths.json")
+            if os.path.exists(src):
+                with open(src, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
                     for k, v in DEFAULTS.items():
@@ -643,13 +840,44 @@ class Store(object):
                                                 for p in loaded["paths"]
                                                 if isinstance(p, str) and p.strip()]
                         migrated = bool(self.data["entries"])
-                    if migrated:
+                    need_save = (src != DATA_FILE or migrated)
+                    if self._reclassify():
+                        need_save = True
+                    if need_save:
                         self.save()
         except Exception as e:
             log("load config failed: %r" % (e,))
 
+    def _reclassify(self):
+        """把老数据里类型标错的条目按新规则纠正（只处理单行、不改内容）。"""
+        changed = False
+        for e in self.data["entries"]:
+            v = e.get("value") or ""
+            t = e.get("type")
+            if t == "text":
+                if not v.strip() or "\n" in v.strip():
+                    continue
+                if is_probably_path(v.strip()):
+                    p = clean_path(v)
+                    e["type"] = "image" if (is_image_file(p) and os.path.isfile(p)) else "path"
+                    e["value"] = p
+                    changed = True
+            elif t == "path":
+                if is_image_file(v) and os.path.isfile(v):
+                    e["type"] = "image"
+                    changed = True
+        if changed:
+            log("reclassified legacy entries")
+        return changed
+
     def items(self):
         return self.data["entries"]
+
+    def counts(self):
+        c = {"path": 0, "text": 0, "image": 0}
+        for e in self.data["entries"]:
+            c[e["type"]] = c.get(e["type"], 0) + 1
+        return c
 
     def save(self):
         try:
@@ -730,8 +958,27 @@ class Store(object):
             entries.insert(0, entry)
         else:
             entries.append(entry)
+        if etype == "image":
+            self._prune_images()
         self.save()
         return True, value
+
+    def _prune_images(self):
+        """图片副本超过上限时，从最旧的开始删（只动存在 images 目录里的副本）。"""
+        entries = self.data["entries"]
+        local = [e for e in entries if e["type"] == "image"
+                 and os.path.normcase(e["value"]).startswith(os.path.normcase(IMAGE_DIR))]
+        while len(local) > MAX_IMAGES:
+            old = local.pop()
+            try:
+                entries.remove(old)
+            except ValueError:
+                pass
+            try:
+                os.remove(old["value"])
+            except Exception:
+                pass
+            log("prune image: %s" % old.get("value"))
 
     def add(self, path, top=True):
         return self.add_entry("path", path, top)
@@ -1026,6 +1273,9 @@ class App(object):
         self.filtered = []
         self.search_text = ""
         self.panel_visible = False
+        self.active_tab = self.store.data.get("active_tab") or "path"
+        if self.active_tab not in TYPE_ORDER:
+            self.active_tab = "path"
         self.keyboard = None
         self._clip_seq = 0
         self._drag = (0, 0)
@@ -1164,21 +1414,39 @@ class App(object):
             widget.bind("<Button-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
 
+        # 分类页签：路径 / 文本 / 图片（各自带条数）
+        tabs = tk.Frame(body, bg=C_BG)
+        tabs.pack(fill="x", padx=(14, 8), pady=(0, 2))
+        self.tab_widgets = {}
+        for key in TYPE_ORDER:
+            holder = tk.Frame(tabs, bg=C_BG)
+            holder.pack(side="left", padx=(0, 14))
+            lbl = tk.Label(holder, text=TYPE_LABEL[key], bg=C_BG, fg=C_DIM,
+                           font=FONT_S, cursor="hand2")
+            lbl.pack()
+            bar = tk.Frame(holder, bg=C_BG, height=2, width=36)
+            bar.pack(fill="x", pady=(2, 0))
+            lbl.bind("<Button-1>", lambda e, k=key: self.set_tab(k))
+            self.tab_widgets[key] = (lbl, bar)
+
         # 卡片列表（无表头，路径自动折行）
         list_wrap = tk.Frame(body, bg=C_BG)
         list_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 2))
         self.list_canvas = tk.Canvas(list_wrap, bg=C_BG, highlightthickness=0, bd=0, yscrollincrement=40)
         self.list_canvas.pack(side="left", fill="both", expand=True)
         # 自绘暗色滚动条（细胶囊滑块，无箭头）
-        self.sb = tk.Canvas(list_wrap, width=8, bg=C_BG, highlightthickness=0, bd=0)
+        self.sb = tk.Canvas(list_wrap, width=16, bg=C_BG, highlightthickness=0, bd=0)
         self.sb.pack(side="right", fill="y", padx=(2, 0))
         self._sb_first, self._sb_last = 0.0, 1.0
         self._sb_grab = 0
         self._sb_dragging = False
+        self._sb_hover = False
         self.sb.bind("<Configure>", lambda e: self._draw_scrollbar())
         self.sb.bind("<Button-1>", self._sb_press)
         self.sb.bind("<B1-Motion>", self._sb_drag)
         self.sb.bind("<ButtonRelease-1>", self._sb_release)
+        self.sb.bind("<Motion>", self._sb_hover_move)
+        self.sb.bind("<Leave>", lambda e: self._sb_set_hover(False))
         self.list_canvas.configure(yscrollcommand=self._on_list_scroll)
         self.list_frame = tk.Frame(self.list_canvas, bg=C_BG)
         self.list_window = self.list_canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
@@ -1252,7 +1520,7 @@ class App(object):
         self.close_search_box()
         self.refresh_list()
 
-        w, h = 440, 480
+        w, h = 460, 520
         left, top, right, bottom = workarea_of_cursor()
         # 跟随鼠标弹出：默认出现在光标右下方，靠边时自动翻转
         pt = wintypes.POINT()
@@ -1419,6 +1687,26 @@ class App(object):
         else:
             self.show_panel(hwnd)
 
+    def set_tab(self, key):
+        if key not in TYPE_ORDER or key == self.active_tab:
+            return
+        self.active_tab = key
+        self.store.data["active_tab"] = key
+        self.store.save()
+        self.refresh_list()
+
+    def _update_tabs(self):
+        counts = self.store.counts()
+        for key in TYPE_ORDER:
+            widgets = getattr(self, "tab_widgets", {}).get(key)
+            if not widgets:
+                continue
+            lbl, bar = widgets
+            active = (key == self.active_tab)
+            lbl.configure(text="%s %d" % (TYPE_LABEL[key], counts.get(key, 0)),
+                          fg=C_FG if active else C_DIM)
+            bar.configure(bg=C_ACCENT if active else C_BG)
+
     def refresh_list(self):
         if not self.panel:
             return
@@ -1427,28 +1715,60 @@ class App(object):
         self.search_label.configure(
             text=self.search_text if self.search_text else "输入关键字筛选…（F2 打中文）",
             fg=C_FG if self.search_text else C_DIM)
+        self._update_tabs()
         items = self.store.items()
-        self.filtered = []
-        for idx, it in enumerate(items):
-            hay = it["value"].lower()
-            if it["type"] == "image":
-                hay = ("图片 " + os.path.basename(it["value"])).lower() + " " + hay
-            if kw and kw not in hay:
-                continue
-            self.filtered.append(idx)
+        sort_on = bool(self.store.data.get("sort_by_letter", True))
+        # 路径页按盘符分组；搜索（跨类型）与文本/图片页仍按首字母
+        by_drive = (not kw) and self.active_tab == "path"
+        color_mode = sort_on and self.store.data.get("group_style", "letter") == "color"
+
+        if kw:
+            cands = []
+            for idx, it in enumerate(items):
+                hay = it["value"].lower()
+                if it["type"] == "image":
+                    hay = ("图片 " + os.path.basename(it["value"])).lower() + " " + hay
+                elif it["type"] == "text":
+                    hay = it["value"].lower() + " 文本"
+                if kw in hay:
+                    cands.append((idx, it))
+        else:
+            cands = [(idx, it) for idx, it in enumerate(items) if it["type"] == self.active_tab]
+        if sort_on:
+            cands.sort(key=lambda pair: entry_sort_key_for(pair[1], by_drive))
 
         for child in self.list_frame.winfo_children():
             child.destroy()
         self.cards = []
         self._thumb_refs = []
-        self.selected_index = 0 if self.filtered else -1
+        self.filtered = [idx for idx, _ in cands]
+        self.selected_index = 0 if cands else -1
 
-        for pos, idx in enumerate(self.filtered):
-            it = items[idx]
+        last_letter = None
+        self.card_styles = []
+        for pos, (idx, it) in enumerate(cands):
             etype, value = it["type"], it["value"]
-            card = tk.Frame(self.list_frame, bg=C_BG2)
-            card.pack(fill="x", pady=(0, 4))
-            bar = tk.Frame(card, bg=C_BG2, width=3)
+            name = entry_name(it)
+
+            # 分组：默认显示盘符/首字母标题；颜色模式下不给文字，用整块底色区分
+            gcolor = None
+            new_group = False
+            if sort_on:
+                letter = entry_group(it, by_drive)[1]
+                if letter != last_letter:
+                    new_group = last_letter is not None
+                    last_letter = letter
+                    if not color_mode:
+                        hdr = tk.Label(self.list_frame, text=letter, bg=C_BG, fg=C_DIM, anchor="w",
+                                       font=("Microsoft YaHei UI", 9, "bold"), padx=4)
+                        hdr.pack(fill="x", pady=((6 if new_group else 0), 2))
+                if color_mode:
+                    gcolor = group_color(letter)
+
+            card_bg = mix_color(C_BG2, gcolor, 0.22) if gcolor else C_BG2
+            card = tk.Frame(self.list_frame, bg=card_bg)
+            card.pack(fill="x", pady=((9 if new_group else 0), 4))
+            bar = tk.Frame(card, bg=(gcolor if gcolor else card_bg), width=(4 if gcolor else 3))
             bar.pack(side="left", fill="y")
 
             if etype == "image":
@@ -1458,13 +1778,20 @@ class App(object):
                     im.thumbnail((56, 56))
                     ph = ImageTk.PhotoImage(im)
                     self._thumb_refs.append(ph)
-                    tk.Label(card, image=ph, bg=C_BG2).pack(side="left", padx=(10, 8), pady=6)
+                    tk.Label(card, image=ph, bg=card_bg).pack(side="left", padx=(10, 8), pady=6)
                 except Exception as e:
                     log("thumb failed: %r" % (e,))
-                show = tk.Label(card, text="图片 · %s" % os.path.basename(value), bg=C_BG2,
+                text = "图片 · %s%s" % (name, "" if os.path.isfile(value) else "（缺失）")
+                show = tk.Label(card, text=text, bg=card_bg,
                                 fg=C_FG, anchor="w", justify="left", font=FONT_S, wraplength=300)
+            elif etype == "text":
+                disp = value if len(value) <= 300 else value[:300] + "…"
+                show = tk.Label(card, text=(disp if not kw else "文本 · " + disp),
+                                bg=card_bg, fg=C_FG, anchor="w", justify="left",
+                                font=FONT_S, wraplength=366, padx=10, pady=8)
             else:
-                show = tk.Label(card, text=value, bg=C_BG2, fg=C_FG, anchor="w", justify="left",
+                show = tk.Label(card, text=(value if not kw else "路径 · " + value),
+                                bg=card_bg, fg=C_FG, anchor="w", justify="left",
                                 font=FONT, wraplength=366, padx=10, pady=8)
             show.pack(side="left", fill="x", expand=True)
 
@@ -1472,13 +1799,15 @@ class App(object):
                 w.bind("<Button-1>", lambda e, p=pos: self.select_pos(p))
                 w.bind("<Double-1>", lambda e: self.commit_selection(True))
             self.cards.append((card, bar, show))
+            self.card_styles.append((card_bg, mix_color(C_SEL, gcolor, 0.22) if gcolor else C_SEL,
+                                     gcolor if gcolor else card_bg))
 
         self._apply_selection()
         total = len(items)
         if kw:
             self.count_label.configure(text="匹配 %d / 共 %d 条" % (len(self.filtered), total))
         else:
-            self.count_label.configure(text="共 %d 条" % total)
+            self.count_label.configure(text="共 %d 条" % len(self.filtered))
         try:
             self.panel.after_idle(self._draw_scrollbar)
         except Exception:
@@ -1514,32 +1843,70 @@ class App(object):
             return
         self._draw_scrollbar()
 
+    _SB_ARROW = 17
+
     def _draw_scrollbar(self):
         sb = getattr(self, "sb", None)
         if not sb or not sb.winfo_exists():
             return
         sb.delete("all")
         h = sb.winfo_height()
+        w = max(6, sb.winfo_width())
         if h <= 4:
             return
+        aw = self._SB_ARROW
         first, last = self._sb_first, self._sb_last
-        if last - first >= 0.995:
+        active = (last - first) < 0.995
+        # 轨道
+        sb.create_rectangle(0, 0, w, h, fill=C_BG2, outline="")
+        # 上下箭头：细线条折角（Windows 10 深色滚动条观感）
+        ac = C_DIM if active else "#5a5a5a"
+        cx = w / 2.0
+        lc = max(4.0, aw * 0.28)
+        ty = aw / 2.0
+        sb.create_line(cx - lc, ty + lc * 0.5, cx, ty - lc * 0.5, fill=ac, width=1)
+        sb.create_line(cx, ty - lc * 0.5, cx + lc, ty + lc * 0.5, fill=ac, width=1)
+        by = h - aw / 2.0
+        sb.create_line(cx - lc, by - lc * 0.5, cx, by + lc * 0.5, fill=ac, width=1)
+        sb.create_line(cx, by + lc * 0.5, cx + lc, by - lc * 0.5, fill=ac, width=1)
+        if h < aw * 2 + 10 or not active:
             return
         y, thumb_h = self._sb_thumb_geom()
-        x0, x1 = 2, 7
-        sb.create_oval(x0, y, x1, y + 6, fill=C_THUMB, outline="")
-        sb.create_oval(x0, y + thumb_h - 6, x1, y + thumb_h, fill=C_THUMB, outline="")
-        sb.create_rectangle(x0, y + 3, x1, y + thumb_h - 3, fill=C_THUMB, outline="")
+        x0, x1 = 1, w - 1
+        fill = "#5e5e5e" if self._sb_hover else C_THUMB
+        # 直角矩形滑块 + 1px 亮边，贴近系统滚动条
+        sb.create_rectangle(x0, y, x1, y + thumb_h, fill=fill, outline="#6e6e6e")
+
+    def _sb_hover_move(self, e):
+        y, thumb_h = self._sb_thumb_geom()
+        self._sb_set_hover(y <= e.y <= y + thumb_h)
+
+    def _sb_set_hover(self, on):
+        if on != self._sb_hover:
+            self._sb_hover = on
+            self._draw_scrollbar()
 
     def _sb_thumb_geom(self):
         h = max(1, self.sb.winfo_height())
-        thumb_h = max(28, int((self._sb_last - self._sb_first) * h))
-        y = int(self._sb_first * h)
-        if y + thumb_h > h:
-            y = h - thumb_h
+        aw = self._SB_ARROW
+        area = max(1, h - 2 * aw)
+        thumb_h = max(24, int((self._sb_last - self._sb_first) * area))
+        y = aw + int(self._sb_first * area)
+        if y + thumb_h > h - aw:
+            y = h - aw - thumb_h
         return y, thumb_h
 
     def _sb_press(self, e):
+        h = max(1, self.sb.winfo_height())
+        aw = self._SB_ARROW
+        if e.y < aw:
+            self.list_canvas.yview_scroll(-1, "pages")
+            self._sb_dragging = False
+            return
+        if e.y > h - aw:
+            self.list_canvas.yview_scroll(1, "pages")
+            self._sb_dragging = False
+            return
         y, thumb_h = self._sb_thumb_geom()
         if y <= e.y <= y + thumb_h:
             self._sb_grab = e.y - y
@@ -1557,8 +1924,10 @@ class App(object):
 
     def _sb_jump(self, thumb_top):
         h = max(1, self.sb.winfo_height())
+        aw = self._SB_ARROW
+        area = max(1, h - 2 * aw)
         span = max(1e-6, self._sb_last - self._sb_first)
-        frac = max(0.0, min(1.0 - span, float(thumb_top) / h))
+        frac = max(0.0, min(1.0 - span, float(thumb_top - aw) / area))
         self.list_canvas.yview_moveto(frac)
 
     def _on_canvas_resize(self, e):
@@ -1580,14 +1949,19 @@ class App(object):
 
     def _apply_selection(self):
         for i, (card, bar, label) in enumerate(self.cards):
+            style = self.card_styles[i] if i < len(self.card_styles) else (C_BG2, C_SEL, C_BG2)
+            bg, sel_bg, bar_bg = style
             if i == self.selected_index:
-                card.configure(bg=C_SEL)
-                bar.configure(bg=C_ACCENT)
-                label.configure(bg=C_SEL)
-            else:
-                card.configure(bg=C_BG2)
-                bar.configure(bg=C_BG2)
-                label.configure(bg=C_BG2)
+                bg, bar_bg = sel_bg, C_ACCENT
+            card.configure(bg=bg)
+            bar.configure(bg=bar_bg)
+            for w in card.winfo_children():
+                if w is bar:
+                    continue
+                try:
+                    w.configure(bg=bg)
+                except Exception:
+                    pass
         self._scroll_to_selected()
 
     def _scroll_to_selected(self):
@@ -1755,23 +2129,8 @@ class App(object):
         return files, txt, img, reused
 
     def _items_from_content(self, files, txt, img, mode="dir"):
-        """原样收录：文件/文件夹按原路径，文本按原文，图片存成 png。不做类型筛选。"""
-        items = []
-        if files:
-            for p in files:
-                v = clean_path(p)
-                if v:
-                    items.append({"type": "path", "value": v})
-            return items
-        if txt:
-            t = txt.replace("\x00", "").strip()
-            if t:
-                items.append({"type": "text", "value": t})
-            return items
-        if img is not None:
-            p = save_image_file(img, IMAGE_DIR)
-            return [{"type": "image", "value": p}] if p else []
-        return []
+        """收录并自动分类：图片文件/位图 → 图片，路径 → 路径，其余文本 → 文本。"""
+        return classify_items(files, txt, img, mode)
 
     def add_from_clipboard(self, silent=False):
         mode = self.store.data.get("copy_file_mode", "dir")
@@ -1806,11 +2165,26 @@ class App(object):
             self.notify("%s：%s" % (tag, label))
         elif not silent:
             self.notify("已在列表中：%s" % label)
+        if added:
+            # 切到刚收录内容所在的分类页，并高亮定位
+            self.active_tab = first["type"]
+            self.store.data["active_tab"] = self.active_tab
         if self.settings_win and self.settings_win.winfo_exists():
             self.refresh_settings()
         if self.panel and self.panel.winfo_viewable():
             self.refresh_list()
+            if added:
+                self._select_entry(first)
         return added
+
+    def _select_entry(self, it):
+        for pos, idx in enumerate(self.filtered):
+            e = self.store.items()[idx]
+            if e["type"] == it["type"] and e["value"] == it["value"]:
+                self.selected_index = pos
+                self._apply_selection()
+                return True
+        return False
 
     def notify(self, msg):
         log("notify: %s" % msg)
@@ -1847,22 +2221,38 @@ class App(object):
                         foreground=C_FG, borderwidth=0, rowheight=28, font=FONT)
         style.map("Set.Treeview", background=[("selected", C_SEL)], foreground=[("selected", "#ffffff")])
         style.configure("Set.Treeview.Heading", background=C_BG2, foreground=C_DIM, borderwidth=0, font=FONT_S)
+        self._set_style = style
+        # 去掉表头行（分类 / 序 / 内容 / 状态），只保留数据行
+        try:
+            style.layout("Set.Treeview", [("Set.Treeview.treearea", {"sticky": "nswe"})])
+        except Exception:
+            pass
 
-        tk.Label(w, text="收藏的路径", bg=C_BG, fg=C_FG, font=("Microsoft YaHei UI", 11, "bold"),
-                 anchor="w").pack(fill="x", padx=14, pady=(12, 6))
-        tk.Label(w, text="复制文件时默认记录所在目录；可上下调整顺序，面板按此顺序显示。",
-                 bg=C_BG, fg=C_DIM, font=FONT_S, anchor="w").pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(w, text="用标签切换分类；组内路径按盘符、文本/图片按首字母分组。",
+                 bg=C_BG, fg=C_DIM, font=FONT_S, anchor="w").pack(fill="x", padx=14, pady=(10, 2))
+
+        # 分类标签（路径 / 文本 / 图片）
+        tabbar = tk.Frame(w, bg=C_BG)
+        tabbar.pack(fill="x", padx=14, pady=(2, 6))
+        self.set_active_tab = getattr(self, "set_active_tab", None) or "path"
+        self.set_tab_widgets = {}
+        for key in TYPE_ORDER:
+            holder = tk.Frame(tabbar, bg=C_BG)
+            holder.pack(side="left", padx=(0, 14))
+            lbl = tk.Label(holder, text=TYPE_LABEL[key], bg=C_BG, fg=C_DIM, font=FONT_S, cursor="hand2")
+            lbl.pack()
+            ubar = tk.Frame(holder, bg=C_BG, height=2, width=36)
+            ubar.pack(fill="x", pady=(2, 0))
+            lbl.bind("<Button-1>", lambda e, k=key: self.set_settings_tab(k))
+            self.set_tab_widgets[key] = (lbl, ubar)
+        self._update_settings_tabs()
 
         wrap = tk.Frame(w, bg=C_BG)
         wrap.pack(fill="both", expand=True, padx=14)
-        self.set_tree = self.ttk.Treeview(wrap, columns=("idx", "path", "state"), show="headings",
+        self.set_tree = self.ttk.Treeview(wrap, show="tree",
                                         style="Set.Treeview", selectmode="browse")
-        self.set_tree.heading("idx", text="#")
-        self.set_tree.heading("path", text="路径")
-        self.set_tree.heading("state", text="状态")
-        self.set_tree.column("idx", width=44, anchor="center", stretch=False)
-        self.set_tree.column("path", width=440, anchor="w", stretch=True)
-        self.set_tree.column("state", width=70, anchor="center", stretch=False)
+        self.set_tree.column("#0", width=560, anchor="w", stretch=True)
+        self.set_tree.tag_configure("sub", foreground=C_DIM)
         vsb = self.ttk.Scrollbar(wrap, orient="vertical", command=self.set_tree.yview)
         self.set_tree.configure(yscrollcommand=vsb.set)
         self.set_tree.pack(side="left", fill="both", expand=True)
@@ -1878,8 +2268,8 @@ class App(object):
             b.pack(side="left", padx=(0, 6))
             return b
 
-        mkbtn("上移", lambda: self._settings_move(-1))
-        mkbtn("下移", lambda: self._settings_move(1))
+        self.move_btns = [mkbtn("上移", lambda: self._settings_move(-1)),
+                          mkbtn("下移", lambda: self._settings_move(1))]
         mkbtn("删除", self._settings_delete)
         mkbtn("添加文件夹", self._settings_add_dir)
         mkbtn("手动添加", self._settings_add_manual)
@@ -1889,6 +2279,24 @@ class App(object):
         opts.pack(fill="x", padx=14, pady=(6, 0))
         tk.Label(opts, text="选项", bg=C_BG, fg=C_FG, font=("Microsoft YaHei UI", 10, "bold"),
                  anchor="w").pack(fill="x", pady=(0, 6))
+
+        self.var_sort = tk.BooleanVar(value=bool(self.store.data.get("sort_by_letter", True)))
+        cbs = tk.Checkbutton(opts, text="自动排序（路径按盘符分组，文本/图片按首字母；中文取拼音）",
+                             variable=self.var_sort, command=self._save_options,
+                             bg=C_BG, fg=C_FG, selectcolor=C_BG2, activebackground=C_BG,
+                             activeforeground=C_FG, font=FONT, anchor="w", bd=0,
+                             highlightthickness=0)
+        cbs.pack(fill="x", anchor="w")
+
+        row_g = tk.Frame(opts, bg=C_BG)
+        row_g.pack(fill="x", padx=24, pady=(3, 2))
+        tk.Label(row_g, text="分组显示：", bg=C_BG, fg=C_DIM, font=FONT_S).pack(side="left", padx=(0, 8))
+        self.var_group = tk.StringVar(value=self.store.data.get("group_style", "letter"))
+        for val, txt in (("letter", "盘符/字母标题"), ("color", "彩色整块")):
+            tk.Radiobutton(row_g, text=txt, variable=self.var_group, value=val,
+                           command=self._save_options, bg=C_BG, fg=C_FG, selectcolor=C_BG2,
+                           activebackground=C_BG, activeforeground=C_FG, font=FONT_S,
+                           bd=0, highlightthickness=0).pack(side="left", padx=(0, 12))
 
         self.var_file_mode = tk.BooleanVar(value=True)
         cb1 = tk.Checkbutton(opts, text="记录所选内容本身（路径 / 文本 / 图片都原样收藏）",
@@ -1959,7 +2367,7 @@ class App(object):
         om.pack(side="left")
         tk.Label(row, text="（终端类窗口用 ctrl_shift_v 或 shift_insert）", bg=C_BG, fg=C_DIM, font=FONT_S).pack(side="left", padx=6)
 
-        tk.Label(opts, text="热键：Win+Alt+V 呼出面板    Win+Alt+C 添加剪贴板路径（固定）",
+        tk.Label(opts, text="热键：Win+Alt+V 呼出面板    Win+Alt+C 收录当前选中/剪贴板内容（路径·文本·图片）",
                  bg=C_BG, fg=C_DIM, font=FONT_S, anchor="w").pack(fill="x", pady=(6, 0))
 
         bottom = tk.Frame(w, bg=C_BG)
@@ -1969,45 +2377,115 @@ class App(object):
                   padx=20, pady=6, font=FONT, cursor="hand2").pack(side="right")
 
         self.refresh_settings()
+        self._sync_move_buttons()
         w.protocol("WM_DELETE_WINDOW", self.close_settings)
         w.focus_force()
+
+    def _sync_move_buttons(self):
+        """首字母排序开启时，手动上移/下移没有意义，置灰。"""
+        on = bool(self.store.data.get("sort_by_letter", True))
+        for b in getattr(self, "move_btns", []):
+            try:
+                b.configure(state="disabled" if on else "normal",
+                             fg=C_DIM if on else C_FG,
+                             cursor="arrow" if on else "hand2")
+            except Exception:
+                pass
 
     def close_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.destroy()
         self.settings_win = None
 
+    def set_settings_tab(self, key):
+        if key not in TYPE_ORDER:
+            return
+        self.set_active_tab = key
+        self.refresh_settings()
+
+    def _update_settings_tabs(self):
+        if not getattr(self, "set_tab_widgets", None):
+            return
+        counts = self.store.counts()
+        for key, (lbl, ubar) in self.set_tab_widgets.items():
+            active = key == self.set_active_tab
+            lbl.configure(text="%s %d" % (TYPE_LABEL[key], counts.get(key, 0)),
+                          fg=(C_FG if active else C_DIM))
+            ubar.configure(bg=(C_ACCENT if active else C_BG))
+
     def refresh_settings(self):
         if not self.settings_win or not self.settings_win.winfo_exists():
             return
-        sel = self.set_tree.selection()
+        tree = self.set_tree
+        sel = tree.selection()
         keep = None
         if sel:
             try:
                 keep = int(sel[0])
             except Exception:
                 keep = None
-        self.set_tree.delete(*self.set_tree.get_children())
-        for idx, it in enumerate(self.store.items()):
+        tree.delete(*tree.get_children())
+        self._set_thumbs = []
+        # 行高与分类列宽度固定，切换标签时窗口尺寸不再跳动
+        try:
+            self._set_style.configure("Set.Treeview", rowheight=40)
+        except Exception:
+            pass
+        items = self.store.items()
+        sort_on = bool(self.store.data.get("sort_by_letter", True))
+
+        def item_row(idx, it, parent):
             etype, value = it["type"], it["value"]
+            thumb = None
             if etype == "path":
-                if os.path.isdir(value):
-                    state = "目录"
-                elif os.path.isfile(value):
-                    state = "文件"
-                else:
-                    state = "缺失"
-                label = value
+                label = value if os.path.exists(value) else value + "（缺失）"
             elif etype == "text":
-                state = "文本"
                 label = value.replace("\n", " ")
+                if len(label) > 120:
+                    label = label[:120] + "…"
             else:
-                state = "图片"
-                label = "图片 · %s" % os.path.basename(value)
-            self.set_tree.insert("", "end", iid=str(idx), values=(idx + 1, label[:200], state))
-        if keep is not None and str(keep) in self.set_tree.get_children():
-            self.set_tree.selection_set(str(keep))
-            self.set_tree.see(str(keep))
+                label = os.path.basename(value)
+                if os.path.isfile(value):
+                    try:
+                        from PIL import Image, ImageTk
+                        im = Image.open(value)
+                        im.thumbnail((34, 34))
+                        thumb = ImageTk.PhotoImage(im)
+                        self._set_thumbs.append(thumb)
+                    except Exception as e:
+                        log("settings thumb failed: %r" % (e,))
+                else:
+                    label = "（缺失）" + label
+            tree.insert(parent, "end", iid=str(idx),
+                        text=label[:200],
+                        image=(thumb if thumb else ""))
+
+        etype = self.set_active_tab
+        rows = [(i, it) for i, it in enumerate(items) if it["type"] == etype]
+        if rows:
+            if sort_on:
+                by_drive = etype == "path"
+                rows.sort(key=lambda pair: entry_sort_key_for(pair[1], by_drive))
+                last = None
+                parent = ""
+                for idx, it in rows:
+                    lbl = entry_group(it, by_drive)[1]
+                    if lbl != last:
+                        sid = "gs_%s_%s" % (etype, lbl)
+                        tree.insert("", "end", iid=sid, text=lbl, open=True, tags=("sub",))
+                        parent = sid
+                        last = lbl
+                    item_row(idx, it, parent)
+            else:
+                for idx, it in rows:
+                    item_row(idx, it, "")
+        self._update_settings_tabs()
+        if keep is not None and tree.exists(str(keep)):
+            tree.selection_set(str(keep))
+            tree.see(str(keep))
+        elif keep is not None:
+            # 条目被删/移动后，尽量保持父分组展开
+            pass
 
     def _settings_selected(self):
         sel = self.set_tree.selection()
@@ -2019,12 +2497,15 @@ class App(object):
             return None
 
     def _settings_move(self, delta):
+        if self.store.data.get("sort_by_letter", True):
+            self.notify("首字母排序开启中，先关闭排序才能手动调整顺序")
+            return
         idx = self._settings_selected()
         if idx is None:
             return
         new = self.store.move(idx, delta)
         self.refresh_settings()
-        if str(new) in self.set_tree.get_children():
+        if self.set_tree.exists(str(new)):
             self.set_tree.selection_set(str(new))
             self.set_tree.see(str(new))
 
@@ -2113,7 +2594,12 @@ class App(object):
         self.store.data["double_confirm"] = bool(self.var_double.get())
         self.store.data["confirm_whitelist"] = self._whitelist_list()
         self.store.data["auto_collect"] = bool(self.var_auto.get())
+        self.store.data["sort_by_letter"] = bool(self.var_sort.get())
+        self.store.data["group_style"] = self.var_group.get()
         self.store.save()
+        self._sync_move_buttons()
+        if self.panel and self.panel.winfo_viewable():
+            self.refresh_list()
 
     def watch_clipboard(self):
         try:
