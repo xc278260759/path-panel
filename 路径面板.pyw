@@ -1170,6 +1170,7 @@ class KeyboardHook(threading.Thread):
 
 WH_MOUSE_LL = 14
 WM_LBUTTONDOWN = 0x0201
+WM_MOUSEWHEEL = 0x020A
 
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
@@ -1207,16 +1208,24 @@ class OutsideClickWatch(threading.Thread):
         except Exception:
             pass
 
+    def _inside(self, x, y):
+        for rx, ry, rw, rh in self.app.hit_rects:
+            if rx <= x < rx + rw and ry <= y < ry + rh:
+                return True
+        return False
+
     def _callback(self, n_code, w_param, l_param):
         try:
-            if n_code == 0 and w_param == WM_LBUTTONDOWN and self.app.panel_visible:
-                rects = self.app.hit_rects
-                if rects:
-                    ms = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                    x, y = int(ms.pt.x), int(ms.pt.y)
-                    for rx, ry, rw, rh in rects:
-                        if rx <= x < rx + rw and ry <= y < ry + rh:
-                            return 0
+            if n_code == 0 and self.app.panel_visible:
+                ms = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                x, y = int(ms.pt.x), int(ms.pt.y)
+                if w_param == WM_MOUSEWHEEL and self._inside(x, y):
+                    delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
+                    self.app.q.put(("wheel", delta))
+                    return 1
+                if w_param == WM_LBUTTONDOWN and self.app.hit_rects:
+                    if self._inside(x, y):
+                        return 0
                     log("outside click at %d,%d -> hide" % (x, y))
                     self.app.q.put(("hide", None))
         except Exception as e:
@@ -2649,6 +2658,14 @@ class App(object):
                     self.notify("双击自动回车确认：%s" % ("开" if self.store.data["double_confirm"] else "关"))
                 elif kind == "hide":
                     self.hide_panel()
+                elif kind == "wheel":
+                    try:
+                        if self.panel and self.panel.winfo_viewable():
+                            steps = int(-payload / 120.0) * 2
+                            if steps:
+                                self.list_canvas.yview_scroll(steps, "units")
+                    except Exception as e:
+                        log("wheel scroll failed: %r" % (e,))
                 elif kind == "key":
                     vk, shift = payload
                     self.handle_hook_key(vk, shift)
